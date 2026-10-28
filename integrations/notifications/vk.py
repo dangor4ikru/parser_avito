@@ -153,7 +153,7 @@ class VKNotifier(Notifier):
                                                                                                        "")))
         title = clean(getattr(ad, "title", ""))
         short_url = f"https://avito.ru/{getattr(ad, 'id', '')}"
-        seller = clean(str(getattr(ad, "sellerId", ""))) if getattr(ad, "sellerId", None) else ""
+        seller = clean(getattr(ad, "seller_name", None) or getattr(ad, "sellerId", None) or "")
 
         parts = []
         if price:
@@ -161,6 +161,10 @@ class VKNotifier(Notifier):
             if getattr(ad, "isPromotion", False):
                 price_part += " 🔥"
             parts.append(price_part)
+
+        price_drop = getattr(ad, "price_drop", None)
+        if price_drop:
+            parts.append(f"📉 Цена снижена на {price_drop} (было {ad.old_price})")
 
         if title:
             parts.append(f"📦 {title}")

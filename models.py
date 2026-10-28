@@ -148,6 +148,25 @@ class Item(BaseModel):
     total_views: int | None = None
     today_views: int | None = None
     phone: str | None = None
+    # сырые поля продавца из каталога: формат у Avito плавает, поэтому Any
+    sellerName: Any = None
+    sellerInfo: Any = None
+    seller_name: str | None = None
+    characteristics: Dict[str, str] | None = None
+    old_price: int | None = None
+
+    @property
+    def price_value(self) -> int:
+        if self.priceDetailed and getattr(self.priceDetailed, "value", None) is not None:
+            return self.priceDetailed.value
+        return 0
+
+    @property
+    def price_drop(self) -> int | None:
+        """На сколько снизилась цена с прошлого раза (None, если не снижалась)"""
+        if self.old_price is not None and self.old_price > self.price_value:
+            return self.old_price - self.price_value
+        return None
 
 
 class ItemsResponse(BaseModel):

@@ -44,6 +44,8 @@ class AvitoConfig:
     one_file_for_link: bool = False
     parse_views: bool = False
     parse_description: bool = False
+    parse_params: bool = False
+    only_price_drops: bool = False
     save_xlsx: bool = True
     use_webdriver: bool = True
     use_bypass_api: bool = False
@@ -57,6 +59,8 @@ class AvitoConfig:
     retry_delay: int = 5
     timeout: int = 20
     block_threshold: int = 3
+    request_delay_min: float = 1.0
+    request_delay_max: float = 3.0
     log_retention_days: int = 5
     log_max_files: int = 10
 

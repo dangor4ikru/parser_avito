@@ -23,6 +23,7 @@ class AdsFilter:
             self._filter_by_recent_time,
             self._filter_by_reserve,
             self._filter_by_promotion,
+            self._filter_by_price_drop,
         ]
 
         for filter_fn in filters:
@@ -113,6 +114,11 @@ class AdsFilter:
                 )
             )
         return [ad for ad in ads if not ad.isPromotion]
+
+    def _filter_by_price_drop(self, ads: List[Item]) -> List[Item]:
+        if not getattr(self.config, "only_price_drops", False):
+            return ads
+        return [ad for ad in ads if ad.price_drop]
 
     @staticmethod
     def _is_phrase_in_ads(ad: Item, phrases: list) -> bool:

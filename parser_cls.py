@@ -1,5 +1,4 @@
 import json
-import random
 import re
 import time
 from datetime import datetime, timedelta
@@ -19,11 +18,14 @@ from load_config import load_avito_config
 from models import ItemsResponse, Item
 from parser.cookies.factory import build_cookies_provider
 from parser.export.factory import build_result_storage
-from parser.http.client import HttpClient
+from parser.extractors import extract_params, extract_seller_name
+from parser.http.client import BlockedError, HttpClient
 from parser.proxies.proxy_factory import build_proxy
 from parser.url_converter import AvitoUrlConverter
 from utils.parse_phone import ParsePhone
 from utils.log_cleanup import clean_old_logs
+from utils.single_instance import SingleInstanceLock
+from utils.random_pause import random_pause
 from version import VERSION
 from lang import SPFA_PROXY_REQUIRED
 
@@ -59,7 +61,10 @@ class AvitoParse:
             timeout=config.timeout,
             max_retries=self.config.max_count_of_retry,
             retry_delay=config.retry_delay,
-            block_threshold=config.block_threshold
+            block_threshold=config.block_threshold,
+            request_delay_min=config.request_delay_min,
+            request_delay_max=config.request_delay_max,
+            stop_event=stop_event,
         )
         self.ads_filter = AdsFilter(config=config, is_viewed_fn=self.is_viewed)
         log_config(config=self.config, version=VERSION)
@@ -172,11 +177,12 @@ class AvitoParse:
 
                 json_data = self.fetch_api_data(api_url=api_url, page=page)
                 if not json_data:
+                    pause = random_pause(self.config.pause_between_links)
                     logger.warning(
                         f"Не удалось получить данные API для {source_url}, "
-                        f"повтор через {self.config.pause_between_links} сек."
+                        f"повтор через {pause:.1f} сек."
                     )
-                    time.sleep(self.config.pause_between_links)
+                    time.sleep(pause)
                     continue
 
                 catalog = self._extract_api_catalog(json_data)
@@ -192,6 +198,7 @@ class AvitoParse:
                 logger.info(f"Объявлений перед фильтрацией {len(ads)}")
                 ads = self._add_seller_to_ads(ads=ads)
                 ads = self._add_promotion_to_ads(ads=ads)
+                ads = self._mark_price_changes(ads=ads)
 
                 if not ads:
                     logger.info(
@@ -203,6 +210,7 @@ class AvitoParse:
                 self.notifier.notify_many(ads=filtered_ads)
                 filtered_ads = self.parse_views(ads=filtered_ads)
                 filtered_ads = self.parse_description(ads=filtered_ads)
+                filtered_ads = self.parse_params(ads=filtered_ads)
                 filtered_ads = self.parse_phone(ads=filtered_ads)
 
                 if filtered_ads:
@@ -210,9 +218,11 @@ class AvitoParse:
                     self.result_storage.save(filtered_ads)
                     self.__save_viewed(ads=filtered_ads)
                     ads_in_link.extend(filtered_ads)
+                self._save_prices(ads=ads)
 
-                logger.info(f"Пауза {self.config.pause_between_links} сек.")
-                time.sleep(self.config.pause_between_links)
+                pause = random_pause(self.config.pause_between_links)
+                logger.info(f"Пауза {pause:.1f} сек.")
+                time.sleep(pause)
 
             if ads_in_link:
                 logger.info(
@@ -265,7 +275,36 @@ class AvitoParse:
         for ad in ads:
             if seller_id := self._extract_seller_slug(data=ad):
                 ad.sellerId = seller_id
+            if seller_name := extract_seller_name(
+                {"sellerName": ad.sellerName, "sellerInfo": ad.sellerInfo}
+            ):
+                ad.seller_name = seller_name
         return ads
+
+    def _mark_price_changes(self, ads: list[Item]) -> list[Item]:
+        """Проставить old_price объявлениям, у которых цена изменилась с прошлого раза."""
+        ids = [ad.id for ad in ads if isinstance(ad.id, int) and not isinstance(ad.id, bool)]
+        try:
+            last_prices = self.db_handler.get_last_prices(ids)
+        except Exception as err:
+            logger.warning(f"Не удалось получить прошлые цены: {err}")
+            return ads
+        for ad in ads:
+            old_price = last_prices.get(ad.id)
+            if isinstance(old_price, int) and old_price != ad.price_value:
+                ad.old_price = old_price
+                if ad.price_drop:
+                    logger.info(
+                        f"id {ad.id}: цена снижена {old_price} -> {ad.price_value} "
+                        f"(-{ad.price_drop})"
+                    )
+        return ads
+
+    def _save_prices(self, ads: list[Item]) -> None:
+        try:
+            self.db_handler.update_prices(ads)
+        except Exception as err:
+            logger.info(f"При сохранении цен в БД ошибка {err}")
 
     @staticmethod
     def _add_promotion_to_ads(ads: list[Item]) -> list[Item]:
@@ -333,7 +372,9 @@ class AvitoParse:
 
         return description or None, total, today
 
-    def _enrich_ads(self, ads: list[Item], *, views: bool, description: bool) -> list[Item]:
+    def _enrich_ads(
+        self, ads: list[Item], *, views: bool, description: bool, params: bool = False
+    ) -> list[Item]:
         total_ads = len(ads)
         for index, ad in enumerate(ads, start=1):
             if self.stop_event and self.stop_event.is_set():
@@ -345,6 +386,15 @@ class AvitoParse:
             try:
                 payload = self.http.fetch_item_data(ad.id)
                 self.good_request_count += 1
+            except BlockedError as err:
+                # не долбим заблокированный IP карточками: смену IP/cookies
+                # выполнит следующий запрос каталога
+                self.bad_request_count += 1
+                logger.warning(
+                    f"{err}. Останавливаю загрузку карточек на этой странице "
+                    f"({index - 1}/{total_ads} обработано)"
+                )
+                break
             except Exception as err:
                 self.bad_request_count += 1
                 logger.warning(f"Ошибка при запросе карточки {ad.id}: {err}")
@@ -361,10 +411,13 @@ class AvitoParse:
                     )
                 if description and full_description:
                     ad.description = full_description
+                if params:
+                    ad.characteristics = extract_params(payload) or ad.characteristics
+                # имя продавца в карточке есть всегда, а в каталоге - не всегда
+                ad.seller_name = extract_seller_name(payload) or ad.seller_name
             except Exception as err:
                 logger.warning(f"Ошибка при разборе карточки {ad.id}: {err}")
                 continue
-            time.sleep(random.uniform(0.1, 0.9))
         return ads
 
     def parse_views(self, ads: list[Item]) -> list[Item]:
@@ -373,7 +426,10 @@ class AvitoParse:
 
         logger.info("Начинаю парсинг просмотров")
         return self._enrich_ads(
-            ads, views=True, description=getattr(self.config, "parse_description", False)
+            ads,
+            views=True,
+            description=getattr(self.config, "parse_description", False),
+            params=getattr(self.config, "parse_params", False),
         )
 
     def parse_description(self, ads: list[Item]) -> list[Item]:
@@ -381,7 +437,24 @@ class AvitoParse:
             return ads
 
         logger.info("Начинаю парсинг полного описания")
-        return self._enrich_ads(ads, views=False, description=True)
+        return self._enrich_ads(
+            ads,
+            views=False,
+            description=True,
+            params=getattr(self.config, "parse_params", False),
+        )
+
+    def parse_params(self, ads: list[Item]) -> list[Item]:
+        """Характеристики объявления (одна карточка на объявление, как и просмотры)."""
+        if (
+            not getattr(self.config, "parse_params", False)
+            or self.config.parse_views
+            or getattr(self.config, "parse_description", False)
+        ):
+            return ads
+
+        logger.info("Начинаю парсинг характеристик")
+        return self._enrich_ads(ads, views=False, description=False, params=True)
 
     def parse_phone(self, ads: list[Item]) -> list[Item]:
         if not self.config.parse_phone or self.config.parse_phone:
@@ -490,6 +563,10 @@ if __name__ == "__main__":
             "pause_between_links и pause_general, чтобы снизить риск блокировок."
         )
 
+    instance_lock = SingleInstanceLock()
+    if not instance_lock.acquire():
+        exit(1)
+
     while True:
         try:
             parser = AvitoParse(config)
@@ -497,8 +574,9 @@ if __name__ == "__main__":
             if config.one_time_start:
                 logger.info("Парсинг завершен т.к. включён one_time_start в настройках")
                 break
-            logger.info(f"Парсинг завершен. Пауза {config.pause_general} сек")
-            time.sleep(config.pause_general)
+            pause = random_pause(config.pause_general)
+            logger.info(f"Парсинг завершен. Пауза {pause:.0f} сек")
+            time.sleep(pause)
         except Exception as err:
             logger.exception(err)
             logger.error(f"Произошла ошибка {err}. Будет повторный запуск через 30 сек.")

@@ -30,6 +30,17 @@ class SQLiteDBHandler:
                 )
                 """
             )
+            # последняя известная цена каждого встреченного объявления
+            # (для отслеживания снижения цены, PR #334 avito-sdk)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS prices (
+                    id INTEGER PRIMARY KEY,
+                    price INTEGER NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
             conn.commit()
 
     def add_record(self, ad: Item):
@@ -65,6 +76,51 @@ class SQLiteDBHandler:
                 """
                 INSERT OR REPLACE INTO viewed (id, price)
                 VALUES (?, ?)
+                """,
+                records,
+            )
+            conn.commit()
+
+    def get_last_prices(self, ids: list[int]) -> dict[int, int]:
+        """Последние известные цены объявлений.
+
+        Если объявления нет в prices (база от старой версии парсера),
+        берём последнюю запись из viewed.
+        """
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT id, price FROM viewed WHERE id IN ({placeholders}) ORDER BY rowid",
+                ids,
+            )
+            prices = dict(cursor.fetchall())
+            cursor.execute(
+                f"SELECT id, price FROM prices WHERE id IN ({placeholders})",
+                ids,
+            )
+            prices.update(cursor.fetchall())
+        return prices
+
+    def update_prices(self, ads: list[Item]) -> None:
+        """Запомнить текущие цены объявлений."""
+        records = [
+            (ad.id, ad.price_value)
+            for ad in ads
+            if isinstance(ad.id, int) and not isinstance(ad.id, bool)
+        ]
+        if not records:
+            return
+        with sqlite3.connect(self.db_name) as conn:
+            conn.executemany(
+                """
+                INSERT INTO prices (id, price, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                    price = excluded.price,
+                    updated_at = CASE WHEN prices.price != excluded.price
+                                      THEN CURRENT_TIMESTAMP ELSE prices.updated_at END
                 """,
                 records,
             )

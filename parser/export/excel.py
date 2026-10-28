@@ -8,6 +8,7 @@ from tzlocal import get_localzone
 
 from parser.export.base import ResultStorage
 from models import Item
+from parser.extractors import format_params
 
 class ExcelStorage(ResultStorage):
     """
@@ -28,7 +29,11 @@ class ExcelStorage(ResultStorage):
         "Поднято",
         "Просмотры (всего)",
         "Просмотры (сегодня)",
-        "Телефон"
+        "Телефон",
+        "Имя продавца",
+        "Старая цена",
+        "Снижение цены",
+        "Характеристики",
     ]
 
     def __init__(self, file_path: Path):
@@ -95,6 +100,13 @@ class ExcelStorage(ResultStorage):
             logger.error(f"При определении лучшего изображения ошибка: {err}")
             return ""
 
+    def _upgrade_headers(self, sheet) -> None:
+        """Дописать новые колонки в шапку файла, созданного старой версией."""
+        if sheet.max_column >= len(self.headers):
+            return
+        for column, header in enumerate(self.headers, start=1):
+            sheet.cell(row=1, column=column, value=header)
+
     @staticmethod
     def excel_safe(value):
         # Formula Injection fix
@@ -109,6 +121,7 @@ class ExcelStorage(ResultStorage):
         with self._lock:
             workbook = load_workbook(self.file_path)
             sheet = workbook.active
+            self._upgrade_headers(sheet)
 
             for ad in ads:
                 images_urls = [
@@ -142,6 +155,10 @@ class ExcelStorage(ResultStorage):
                     ad.total_views if ad.total_views is not None else "",
                     ad.today_views if ad.today_views is not None else "",
                     self.excel_safe(ad.phone or ""),
+                    self.excel_safe(ad.seller_name or ""),
+                    ad.old_price if ad.old_price is not None else "",
+                    ad.price_drop or "",
+                    self.excel_safe(format_params(ad.characteristics)),
                 ]
 
                 sheet.append(row)

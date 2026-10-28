@@ -14,6 +14,8 @@ from load_config import save_avito_config, load_avito_config
 from parser_cls import AvitoParse
 from utils import prompt_user_login
 from utils.log_cleanup import clean_old_logs
+from utils.single_instance import SingleInstanceLock
+from utils.random_pause import random_pause
 from version import VERSION
 
 
@@ -32,6 +34,7 @@ def main(page: ft.Page):
 
     is_run = False
     stop_event = threading.Event()
+    instance_lock = SingleInstanceLock()
 
     def set_up():
         """Загружает настройки из config.toml и применяет к интерфейсу"""
@@ -65,6 +68,8 @@ def main(page: ft.Page):
         one_file_for_link.value = config.one_file_for_link
         parse_views.value = config.parse_views
         parse_description.value = getattr(config, "parse_description", False)
+        parse_params.value = config.parse_params
+        only_price_drops.value = config.only_price_drops
         save_xlsx.value = config.save_xlsx
         use_webdriver.value = config.use_webdriver
         use_bypass_api.value = config.use_bypass_api
@@ -77,12 +82,20 @@ def main(page: ft.Page):
         retry_delay.value = config.retry_delay
         timeout.value = config.timeout
         block_threshold.value = config.block_threshold
+        request_delay_min.value = config.request_delay_min
+        request_delay_max.value = config.request_delay_max
 
         page.update()
 
     def to_int_safe(value, default=0):
         try:
             return int(value)
+        except (ValueError, TypeError):
+            return default
+
+    def to_float_safe(value, default=0.0):
+        try:
+            return float(str(value).replace(",", "."))
         except (ValueError, TypeError):
             return default
 
@@ -113,6 +126,8 @@ def main(page: ft.Page):
             "one_file_for_link": one_file_for_link.value,
             "parse_views": parse_views.value,
             "parse_description": parse_description.value,
+            "parse_params": parse_params.value,
+            "only_price_drops": only_price_drops.value,
             "save_xlsx": save_xlsx.value,
             "use_webdriver": use_webdriver.value,
             "use_bypass_api": use_bypass_api.value,
@@ -124,7 +139,9 @@ def main(page: ft.Page):
             "tg_only_text": tg_only_text.value,
             "retry_delay": to_int_safe(retry_delay.value, 5),
             "timeout": to_int_safe(timeout.value, 20),
-            "block_threshold": to_int_safe(block_threshold.value, 3)
+            "block_threshold": to_int_safe(block_threshold.value, 3),
+            "request_delay_min": to_float_safe(request_delay_min.value, 1.0),
+            "request_delay_max": to_float_safe(request_delay_max.value, 3.0),
         }}
 
         save_avito_config(config)
@@ -241,6 +258,8 @@ def main(page: ft.Page):
         result_own_cookies = check_own_cookies()
         if not result_proxy or not result_own_cookies:
             return
+        if not instance_lock.acquire():
+            return
         logger.info("Старт")
         stop_event.clear()
         save_config()
@@ -268,13 +287,15 @@ def main(page: ft.Page):
                     page.window.close()
                     break
 
-                logger.info("Пауза между повторами")
-                for _ in range(int(pause_general.value if pause_general.value else 300)):
+                pause = random_pause(to_int_safe(pause_general.value, 300))
+                logger.info(f"Пауза между повторами {pause:.0f} сек.")
+                for _ in range(int(pause)):
                     if not is_run or stop_event.is_set():
                         break
                     time.sleep(1)
 
             is_run = False
+            instance_lock.release()
             logger.info("Завершено")
             try:
                 start_btn.text = "Старт"
@@ -560,6 +581,10 @@ def main(page: ft.Page):
                                     tooltip=PARSE_VIEWS_HELP)
     parse_description = ft.Checkbox(label="Парсить описание полностью", value=False,
                                     tooltip="Загружает полное описание из карточки вместо краткого анонса")
+    parse_params = ft.Checkbox(label="Парсить характеристики", value=False,
+                               tooltip=PARSE_PARAMS_HELP)
+    only_price_drops = ft.Checkbox(label="Только снижение цены", value=False,
+                                   tooltip=ONLY_PRICE_DROPS_HELP)
     parse_phone = ft.Checkbox(label="Парсить телефоны", value=False, on_change=check_api_key_exist,
                               tooltip=PARSE_PHONE_HELP)
 
@@ -579,6 +604,10 @@ def main(page: ft.Page):
                                       tooltip=TIMEOUT_HELP)
     block_threshold = ft.TextField(label="Попыток перед разблокировкой", width=300, text_size=12, height=40, expand=True,
                                       tooltip=BLOCK_THRESHOLD_HELP)
+    request_delay_min = ft.TextField(label="Пауза между запросами ОТ, сек", width=300, text_size=12,
+                                     height=40, expand=True, tooltip=REQUEST_DELAY_HELP)
+    request_delay_max = ft.TextField(label="Пауза между запросами ДО, сек", width=300, text_size=12,
+                                     height=40, expand=True, tooltip=REQUEST_DELAY_HELP)
 
 
     accordion = ft.ExpansionPanelList(
@@ -709,11 +738,14 @@ def main(page: ft.Page):
                 [
                     ft.Row([pause_general, pause_between_links, block_threshold]),
                     ft.Row([max_count_of_retry, retry_delay, timeout]),
+                    ft.Row([request_delay_min, request_delay_max]),
                     ft.Row([one_time_start, one_file_for_link]),
                     ft.Row([parse_views,
                             parse_description,
+                            parse_params,
                             #parse_phone,
                             save_xlsx]),
+                    ft.Row([only_price_drops]),
                 ]
             ),
 
